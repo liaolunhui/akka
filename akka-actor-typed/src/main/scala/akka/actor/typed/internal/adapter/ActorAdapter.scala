@@ -7,6 +7,7 @@ package internal
 package adapter
 
 import akka.actor.InternalMessage
+import akka.actor.typed.Behavior.{ isAlive, validateAsInitial }
 
 import scala.annotation.tailrec
 import akka.{ actor ⇒ a }
@@ -18,7 +19,7 @@ import scala.util.control.NonFatal
 /**
  * INTERNAL API
  */
-@InternalApi private[typed] class ActorAdapter[T](_initialBehavior: Behavior[T]) extends a.Actor with a.ActorLogging {
+@InternalApi private[typed] abstract class ActorAdapter[T](_initialBehavior: Behavior[T]) extends a.Actor with a.ActorLogging {
   import Behavior._
 
   protected var behavior: Behavior[T] = _initialBehavior
@@ -33,16 +34,6 @@ import scala.util.control.NonFatal
    * child exception in Terminated for direct children.
    */
   private var failures: Map[a.ActorRef, Throwable] = Map.empty
-
-  def receive = running
-
-  def running: Receive = {
-    // optimization, minimize type matches that has to be done for every message
-    case internal: InternalMessage ⇒
-      handleInternalMessage(internal)
-    case msg: T @unchecked ⇒
-      handleMessage(msg)
-  }
 
   protected final def handleInternalMessage(msg: InternalMessage): Unit = msg match {
     case a.Terminated(ref) ⇒
@@ -133,15 +124,6 @@ import scala.util.control.NonFatal
   override def preStart(): Unit =
     if (!isAlive(behavior))
       context.stop(self)
-    else
-      start()
-
-  protected def start(): Unit = {
-    context.become(running)
-    initializeContext()
-    behavior = validateAsInitial(Behavior.start(behavior, ctx))
-    if (!isAlive(behavior)) context.stop(self)
-  }
 
   override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
     Behavior.interpretSignal(behavior, ctx, PreRestart)
@@ -174,9 +156,25 @@ import scala.util.control.NonFatal
   }
 }
 
+/**
+ * INTERNAL API
+ *
+ * Optimized adapter for running typed behaviors
+ */
 @InternalApi
 private[typed] final class OptimizedActorAdapter[T](_initialBehavior: Behavior[T]) extends ActorAdapter[T](_initialBehavior) {
-  override def receive: Receive = null // not used
+  override def receive: Receive = null // optimization: not used
+
+  override def preStart(): Unit = {
+    initializeContext()
+    if (!isAlive(behavior)) context.stop(self)
+    else start()
+  }
+
+  private def start(): Unit = {
+    behavior = validateAsInitial(Behavior.start(behavior, ctx))
+    if (!isAlive(behavior)) context.stop(self)
+  }
 
   override protected[akka] def aroundReceive(receive: Receive, msg: Any): Unit = {
     // as we know we never become in "normal" typed actors, it is just the behavior
@@ -197,14 +195,21 @@ private[typed] final class OptimizedActorAdapter[T](_initialBehavior: Behavior[T
  * That will allow to defer typed processing until the untyped ActorSystem has completely started up.
  */
 @InternalApi
-private[typed] class GuardianActorAdapter[T](_initialBehavior: Behavior[T]) extends ActorAdapter[T](_initialBehavior) {
+private[typed] final class GuardianActorAdapter[T](_initialBehavior: Behavior[T]) extends ActorAdapter[T](_initialBehavior) {
   import Behavior._
 
+  def receive: Receive = waitingForStart(Nil)
+
+  def running: Receive = {
+    // optimization, minimize type matches that has to be done for every message
+    case internal: InternalMessage ⇒
+      handleInternalMessage(internal)
+    case msg: T @unchecked ⇒
+      handleMessage(msg)
+  }
+
   override def preStart(): Unit =
-    if (!isAlive(behavior))
-      context.stop(self)
-    else
-      context.become(waitingForStart(Nil))
+    if (!isAlive(behavior)) context.stop(self)
 
   def waitingForStart(stashed: List[Any]): Receive = {
     case GuardianActorAdapter.Start ⇒
@@ -216,6 +221,13 @@ private[typed] class GuardianActorAdapter[T](_initialBehavior: Behavior[T]) exte
       context.become(waitingForStart(other :: stashed))
   }
 
+  protected def start(): Unit = {
+    context.become(running)
+    initializeContext()
+    behavior = validateAsInitial(Behavior.start(behavior, ctx))
+    if (!isAlive(behavior)) context.stop(self)
+  }
+
   override def postRestart(reason: Throwable): Unit = {
     initializeContext()
 
@@ -224,7 +236,6 @@ private[typed] class GuardianActorAdapter[T](_initialBehavior: Behavior[T]) exte
 
   override def postStop(): Unit = {
     initializeContext()
-
     super.postStop()
   }
 }
